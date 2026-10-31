@@ -4,9 +4,9 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # 配置密钥与 API 信息
-TELEGRAM_BOT_TOKEN = "你的_TELEGRAM_BOT_TOKEN"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 YOUR_API_KEY = "sk-NAZIlSMeQxpLmS3IuX1vcAh7c1usKKbihB9Ktof1kNVCfGSO"
-YOUR_API_URL = "{"_type":"newapi_channel_conn","key":"sk-NAZIlSMeQxpLmS3IuX1vcAh7c1usKKbihB9Ktof1kNVCfGSO","url":"https://kapibala.asia"}" # 替换为你的 API 地址
+YOUR_API_URL = "https://kapibala.asia/v1/chat/completions"  # API 地址
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 你好！随时将文本文件或文档发给我，我会为你处理。")
@@ -64,6 +64,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(output_file_path): os.remove(output_file_path)
 
 if __name__ == "__main__":
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit("请先设置环境变量 TELEGRAM_BOT_TOKEN，例如：export TELEGRAM_BOT_TOKEN=你的机器人Token")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.DOCUMENT, handle_document))
