@@ -12,6 +12,7 @@ final class PowerMonitor: ObservableObject {
 
     private var timer: Timer?
     private var estimator = ChargePowerEstimator()
+    private var lastEstimate: Double?
     private var lastTick: Date?
     private let historyWindow: TimeInterval = 600
 
@@ -41,6 +42,7 @@ final class PowerMonitor: ObservableObject {
         samples.removeAll()
         latest = nil
         estimator.reset()
+        lastEstimate = nil
         lastTick = nil
     }
 
@@ -56,6 +58,12 @@ final class PowerMonitor: ObservableObject {
         let isExternal = reading?.externalConnected ?? (deviceState != .unplugged)
 
         let estimated = estimator.estimatedWatts(level: level, at: now, charging: isCharging)
+        // 电量估算刷新很慢，中间保持上一次有效值，避免数值来回跳成 0
+        if let estimated {
+            lastEstimate = estimated
+        } else if !isCharging {
+            lastEstimate = nil
+        }
 
         let voltage: Double?
         let current: Double?
@@ -74,10 +82,10 @@ final class PowerMonitor: ObservableObject {
             current = amps
             watts = power
             source = "硬件寄存器实测"
-        } else if let estimated {
+        } else if let heldEstimate = lastEstimate, isCharging {
             voltage = nil
             current = nil
-            watts = estimated
+            watts = heldEstimate
             source = "电量变化估算"
         } else {
             voltage = nil

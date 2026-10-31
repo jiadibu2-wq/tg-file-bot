@@ -44,8 +44,8 @@ struct ChargePowerEstimator {
     var batteryCapacityWh: Double = 13.0
 
     private var history: [(date: Date, level: Double)] = []
-    private let window: TimeInterval = 600
-    private let minimumSpan: TimeInterval = 90
+    private let window: TimeInterval = 900
+    private let minimumSpan: TimeInterval = 120
 
     mutating func estimatedWatts(level: Double, at date: Date, charging: Bool) -> Double? {
         history.append((date, level))
@@ -57,8 +57,9 @@ struct ChargePowerEstimator {
 
         let span = newest.date.timeIntervalSince(first.date)
         let delta = newest.level - first.level
-        guard span >= minimumSpan, delta > 0.005 else { return nil }
-        return delta * batteryCapacityWh / span
+        // 系统电量只能按 1%~5% 跳变，跨度太短会算出离谱的数字，所以要求至少 2 分钟
+        guard span >= minimumSpan, delta > 0.03 else { return nil }
+        return delta * batteryCapacityWh * 3600 / span
     }
 
     mutating func reset() {
