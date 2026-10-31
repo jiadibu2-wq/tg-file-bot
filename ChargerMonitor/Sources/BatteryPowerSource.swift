@@ -1,12 +1,12 @@
 import Foundation
-import IOKit
+import Darwin
 
-/// 从 IOPMPowerSource 读取电源管理寄存器。
-/// 注意：iOS 没有公开这个接口，部分系统版本可能读取不到（沙盒限制），
-/// 此时 `read()` 返回 nil，上层会自动回退到电量变化估算。
-struct BatteryPowerSourceReading {
+/// 通过运行时 dlopen/dlsym 访问 IOKit 私有接口读取 IOPMPowerSource。
+/// iOS SDK 不公开 IOKit 模块，所以不能 `import IOKit`，只能在运行时找符号。
+/// 若系统禁止（沙盒/无该框架），`read()` 返回 nil，上层回退到电量变化估算。
+struct PowerSourceReading {
     var voltageMillivolts: Double?
-    /// 毫安，符号因机型而异（充电时可能为负）
+    /// 毫安，符号因机型而异
     var currentMilliamps: Double?
     /// 0...1
     var level: Double?
@@ -16,7 +16,22 @@ struct BatteryPowerSourceReading {
     var rawEntries: [DiagnosticEntry]
 }
 
-enum BatteryPowerSourceReader {
+final class IOMPowerSourceReader {
+    private typealias MatchingServicesFn = @convention(c) (UInt32, UnsafeRawPointer?, UnsafeMutablePointer<UInt32>?) -> Int32
+    private typealias IteratorNextFn = @convention(c) (UInt32) -> UInt32
+    private typealias ObjectReleaseFn = @convention(c) (UInt32) -> Int32
+    private typealias CreatePropertyFn = @convention(c) (UInt32, UnsafeRawPointer?, UnsafeRawPointer?, UInt32) -> UnsafeMutableRawPointer?
+    private typealias ServiceMatchingFn = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutableRawPointer?
+
+    private let matchingServices: MatchingServicesFn?
+    private let iteratorNext: IteratorNextFn?
+    private let objectRelease: ObjectReleaseFn?
+    private let createProperty: CreatePropertyFn?
+    private let serviceMatching: ServiceMatchingFn?
+
+    /// 加载失败原因，展示在诊断页
+    let loadError: String?
+
     private static let keys: [String] = [
         "Voltage", "Current", "Amperage", "InstantAmperage", "BatteryPower",
         "CurrentCapacity", "MaxCapacity", "AppleRawCurrentCapacity", "AppleRawMaxCapacity",
@@ -24,56 +39,110 @@ enum BatteryPowerSourceReader {
         "ExternalConnected", "IsCharging", "FullyCharged", "TimeRemaining", "TimeToFullCharge"
     ]
 
-    static func read() -> BatteryPowerSourceReading? {
-        var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(0, IOServiceMatching("IOPMPowerSource"), &iterator) == KERN_SUCCESS,
-              iterator != 0 else {
+    init() {
+        let paths = [
+            "/System/Library/PrivateFrameworks/IOKit.framework/IOKit",
+            "/System/Library/Frameworks/IOKit.framework/IOKit",
+            "/usr/lib/libIOKit.dylib",
+            "IOKit"
+        ]
+
+        var handle: UnsafeMutableRawPointer?
+        for path in paths {
+            if let opened = dlopen(path, RTLD_LAZY) {
+                handle = opened
+                break
+            }
+        }
+
+        guard let handle else {
+            matchingServices = nil
+            iteratorNext = nil
+            objectRelease = nil
+            createProperty = nil
+            serviceMatching = nil
+            loadError = "无法加载 IOKit 框架"
+            return
+        }
+
+        func symbol<T>(_ name: String, _ type: T.Type) -> T? {
+            guard let pointer = dlsym(handle, name) else { return nil }
+            return unsafeBitCast(pointer, to: T.self)
+        }
+
+        matchingServices = symbol("IOServiceGetMatchingServices", MatchingServicesFn.self)
+        iteratorNext = symbol("IOIteratorNext", IteratorNextFn.self)
+        objectRelease = symbol("IOObjectRelease", ObjectReleaseFn.self)
+        createProperty = symbol("IORegistryEntryCreateCFProperty", CreatePropertyFn.self)
+        serviceMatching = symbol("IOServiceMatching", ServiceMatchingFn.self)
+
+        if matchingServices == nil || iteratorNext == nil || objectRelease == nil ||
+            createProperty == nil || serviceMatching == nil {
+            loadError = "IOKit 符号缺失"
+        } else {
+            loadError = nil
+        }
+    }
+
+    func read() -> PowerSourceReading? {
+        guard let matchingServices, let iteratorNext, let objectRelease,
+              let createProperty, let serviceMatching else { return nil }
+
+        var iterator: UInt32 = 0
+        let matching = "IOPMPowerSource".withCString { serviceMatching($0) }
+        guard let matching else { return nil }
+
+        let status = matchingServices(0, UnsafeRawPointer(matching), &iterator)
+        if status != 0 {
+            // 失败时字典未被消费，需要手动释放
+            Unmanaged<AnyObject>.fromOpaque(matching).release()
             return nil
         }
-        defer { IOObjectRelease(iterator) }
+        guard iterator != 0 else { return nil }
 
-        let entry = IOIteratorNext(iterator)
+        let entry = iteratorNext(iterator)
+        _ = objectRelease(iterator)
         guard entry != 0 else { return nil }
-        defer { IOObjectRelease(entry) }
+        defer { _ = objectRelease(entry) }
 
         var values: [String: Any] = [:]
         var entries: [DiagnosticEntry] = []
-        for key in keys {
-            guard let unmanaged = IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0) else {
-                continue
-            }
-            let value = unmanaged.takeRetainedValue()
+        for key in Self.keys {
+            let cfKey = key as NSString
+            let keyPointer = Unmanaged.passUnretained(cfKey).toOpaque()
+            guard let raw = createProperty(entry, keyPointer, nil, 0) else { continue }
+            let value = Unmanaged<AnyObject>.fromOpaque(raw).takeRetainedValue()
             values[key] = value
-            entries.append(DiagnosticEntry(key: key, value: describe(value)))
+            entries.append(DiagnosticEntry(key: key, value: Self.describe(value)))
         }
         guard !entries.isEmpty else { return nil }
 
-        let voltage = number(values["Voltage"])
-        let current = number(values["Amperage"])
-            ?? number(values["InstantAmperage"])
-            ?? number(values["Current"])
+        let voltage = Self.number(values["Voltage"])
+        let current = Self.number(values["Amperage"])
+            ?? Self.number(values["InstantAmperage"])
+            ?? Self.number(values["Current"])
 
         var level: Double?
-        if let currentCapacity = number(values["CurrentCapacity"]),
-           let maxCapacity = number(values["MaxCapacity"]), maxCapacity > 0 {
+        if let currentCapacity = Self.number(values["CurrentCapacity"]),
+           let maxCapacity = Self.number(values["MaxCapacity"]), maxCapacity > 0 {
             level = min(max(currentCapacity / maxCapacity, 0), 1)
-        } else if let rawCapacity = number(values["AppleRawCurrentCapacity"]),
-                  let rawMaxCapacity = number(values["AppleRawMaxCapacity"]), rawMaxCapacity > 0 {
+        } else if let rawCapacity = Self.number(values["AppleRawCurrentCapacity"]),
+                  let rawMaxCapacity = Self.number(values["AppleRawMaxCapacity"]), rawMaxCapacity > 0 {
             level = min(max(rawCapacity / rawMaxCapacity, 0), 1)
         }
 
-        return BatteryPowerSourceReading(
+        return PowerSourceReading(
             voltageMillivolts: voltage,
             currentMilliamps: current,
             level: level,
-            isCharging: boolean(values["IsCharging"]),
-            externalConnected: boolean(values["ExternalConnected"]),
-            cycleCount: number(values["CycleCount"]).map { Int($0) },
+            isCharging: Self.boolean(values["IsCharging"]),
+            externalConnected: Self.boolean(values["ExternalConnected"]),
+            cycleCount: Self.number(values["CycleCount"]).map { Int($0) },
             rawEntries: entries
         )
     }
 
-    private static func describe(_ value: CFTypeRef) -> String {
+    private static func describe(_ value: Any) -> String {
         if let number = value as? NSNumber {
             return number.stringValue
         }

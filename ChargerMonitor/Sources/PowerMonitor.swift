@@ -12,6 +12,7 @@ final class PowerMonitor: ObservableObject {
 
     private var timer: Timer?
     private var estimator = ChargePowerEstimator()
+    private let powerReader = IOMPowerSourceReader()
     private var lastEstimate: Double?
     private var lastTick: Date?
     private let historyWindow: TimeInterval = 600
@@ -51,7 +52,7 @@ final class PowerMonitor: ObservableObject {
         let device = UIDevice.current
         let deviceLevel = device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil
         let deviceState = device.batteryState
-        let reading = BatteryPowerSourceReader.read()
+        let reading = powerReader.read()
 
         let level = reading?.level ?? deviceLevel ?? 0
         let isCharging = reading?.isCharging ?? (deviceState == .charging || deviceState == .full)
@@ -117,8 +118,17 @@ final class PowerMonitor: ObservableObject {
         }
         lastTick = now
 
+        let backend: String
+        if let reading, !reading.rawEntries.isEmpty {
+            backend = "IOKit 私有接口（IOPMPowerSource）"
+        } else if let loadError = powerReader.loadError {
+            backend = "接口不可用：\(loadError)"
+        } else {
+            backend = "接口无数据（使用电量估算）"
+        }
+
         diagnostics = Diagnostics(
-            backend: reading == nil ? "不可用（使用电量估算）" : "IOPMPowerSource",
+            backend: backend,
             updatedAt: now,
             entries: reading?.rawEntries ?? []
         )
